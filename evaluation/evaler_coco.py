@@ -11,9 +11,23 @@ from lib.config import cfg
 
 
 class CocoEvaler(object):
-    def __init__(self, eval_ids, gv_feat, att_feats, eval_annfile, max_samples=None, enable_eval_loss=False):
+    def __init__(self, eval_ids, gv_feat, att_feats, eval_annfile, max_samples=None, enable_eval_loss=False, eval_mode='byteformer'):
         super(CocoEvaler, self).__init__()
-        self.vocab = utils.load_vocab(cfg.INFERENCE.VOCAB)
+
+        self.eval_mode = eval_mode # 保存评估模式
+
+        if self.eval_mode == 'blip':
+            from transformers import BlipProcessor, BlipForConditionalGeneration
+            print("[信息] 正在以 BLIP 模式初始化评估器...")
+            self.blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            self.blip_model = BlipForConditionalGeneration.from_pretrained("blip-image-captioning-base", use_safetensors=True)
+            self.blip_model.to('cuda' if torch.cuda.is_available() else 'cpu')
+            self.blip_model.eval()
+        else: # byteformer 模式
+            print("[信息] 正在以 ByteFormer 模式初始化评估器...")
+            self.vocab = utils.load_vocab(cfg.INFERENCE.VOCAB)
+        # --------------------------------
+
         self.max_samples = max_samples
         self.enable_eval_loss = enable_eval_loss
         
@@ -30,7 +44,7 @@ class CocoEvaler(object):
             self.eval_ids = None  # set after loader
 
         # Build loader (uses ids_path basename to infer split)
-        self.eval_loader = data_loader.load_val(eval_ids, gv_feat, att_feats, max_samples=self.max_samples)
+        self.eval_loader = data_loader.load_val(eval_ids, gv_feat, att_feats, max_samples=self.max_samples, eval_mode=self.eval_mode)
         if self.eval_ids is None:
             # For Flickr8k, load the actual image IDs from the JSON file if available
             if eval_ids and os.path.exists(eval_ids):
@@ -110,7 +124,8 @@ class CocoEvaler(object):
         return kwargs
 
     def __call__(self, model, rname):
-        model.eval()
+        if self.eval_mode == 'byteformer':
+            model.eval() # 只有 byteformer 模式需要操作传入的 model
 
         results = []
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -124,90 +139,123 @@ class CocoEvaler(object):
         loss_sum = 0.0
         loss_count = 0
         # output_indices = {0, 5, 10, 15, 20, 25}
+        # 初始化无法解码图像的计数器
+        undecodable_count = 0
         with torch.no_grad():
             # Use tqdm without desc to avoid interference with sample output
-            pbar = tqdm.tqdm(self.eval_loader, desc=f"Evaluating {rname}", leave=False)
-            for _, (indices, gv_feat, att_feats, att_mask) in enumerate(pbar):
+            pbar = tqdm.tqdm(self.eval_loader, desc=f"Evaluating {rname} ({self.eval_mode} mode)", leave=False)
+            for _, data_batch in enumerate(pbar):
+                indices, gv_feat = data_batch[0], data_batch[1]
+
                 ids = self.eval_ids[indices]
-                gv_feat = gv_feat.to(device)
-                att_feats = att_feats.to(device)
-                if att_mask is not None:
-                    att_mask = att_mask.to(device)
-                kwargs = self.make_kwargs(indices, ids, gv_feat, att_feats, att_mask)
-                # 尝试构建输入/目标序列以计算XE loss（仅当启用且数据集支持时）
+                # gv_feat = gv_feat.to(device)
                 batch_loss = None
-                if self.loss_computation_ready and xe_criterion is not None:
-                    try:
-                        # 评估模式下需要手动构建序列，因为数据集只返回 (indices, gv_feat, att_feats)
-                        dataset = self.eval_loader.dataset
-                        # 校验数据集是否具备所需方法
-                        if not hasattr(dataset, '_build_seqs_from_captions'):
-                            raise AttributeError('Dataset lacks _build_seqs_from_captions; cannot compute eval XE loss')
 
-                        input_list = []
-                        target_list = []
-                        for idx in indices:
-                            # 取出原始 sample （COCO 重构后 _build_seqs_from_captions 需要传入 sample 字典）
-                            sample = dataset.ds[int(idx)] if hasattr(dataset, 'ds') else None
-                            if sample is None:
-                                raise ValueError('Unable to retrieve sample for XE loss computation')
-                            in_arr, tgt_arr = dataset._build_seqs_from_captions(sample)
-                            # _build_seqs_from_captions 返回 (seq_per_img, seq_len)
-                            # 对于评估，我们需要所有5个序列来匹配模型的seq_per_img设置
-                            for seq_idx in range(cfg.DATA_LOADER.SEQ_PER_IMG):
-                                if seq_idx < in_arr.shape[0]:
-                                    input_list.append(in_arr[seq_idx])
-                                    target_list.append(tgt_arr[seq_idx])
-                                else:
-                                    # 如果序列不足5个，重复最后一个
-                                    input_list.append(in_arr[-1])
-                                    target_list.append(tgt_arr[-1])
-                        
-                        if len(input_list) > 0:
-                            input_seq = torch.from_numpy(np.stack(input_list, 0)).long().to(device)
-                            target_seq = torch.from_numpy(np.stack(target_list, 0)).long().to(device)
+                if self.eval_mode == 'blip':
+                    sents = []
+
+                    blip_images = data_batch[2] # 第三个元素是 blip_images
+                    undecodable_count += blip_images.count(None)
+                    
+                    valid_images_with_indices = [(i, img) for i, img in enumerate(blip_images) if img is not None]
+                    generated_captions = []
+                    original_indices = []
+                    if valid_images_with_indices:
+                        original_indices, valid_images = zip(*valid_images_with_indices)
+                        # 将图像列表堆叠成一个批次张量
+                        inputs = self.blip_processor(images=list(valid_images), return_tensors="pt").to(self.blip_model.device)
+                        generated_ids = self.blip_model.generate(**inputs)
+                        generated_captions = self.blip_processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+                    captions_iterator = iter(generated_captions)
+                    temp_results = {idx: cap for idx, cap in zip(original_indices, captions_iterator)}
+                    
+                    dummy_caption = "this is a dummy caption for an undecodable image"
+                    for i in range(len(blip_images)):
+                        sents.append(temp_results.get(i, dummy_caption))
+
+                else: # byteformer 模式
+                    att_feats = data_batch[2]
+                    att_mask = data_batch[3]
+                    gv_feat = gv_feat.to(device)
+                    att_feats = att_feats.to(device)
+                    if att_mask is not None:
+                        att_mask = att_mask.to(device)
+                    kwargs = self.make_kwargs(indices, ids, gv_feat, att_feats, att_mask)
+                    # 尝试构建输入/目标序列以计算XE loss（仅当启用且数据集支持时）
+                    # batch_loss = None
+                    if self.loss_computation_ready and xe_criterion is not None:
+                        try:
+                            # 评估模式下需要手动构建序列，因为数据集只返回 (indices, gv_feat, att_feats)
+                            dataset = self.eval_loader.dataset
+                            # 校验数据集是否具备所需方法
+                            if not hasattr(dataset, '_build_seqs_from_captions'):
+                                raise AttributeError('Dataset lacks _build_seqs_from_captions; cannot compute eval XE loss')
+
+                            input_list = []
+                            target_list = []
+                            for idx in indices:
+                                # 取出原始 sample （COCO 重构后 _build_seqs_from_captions 需要传入 sample 字典）
+                                sample = dataset.ds[int(idx)] if hasattr(dataset, 'ds') else None
+                                if sample is None:
+                                    raise ValueError('Unable to retrieve sample for XE loss computation')
+                                in_arr, tgt_arr = dataset._build_seqs_from_captions(sample)
+                                # _build_seqs_from_captions 返回 (seq_per_img, seq_len)
+                                # 对于评估，我们需要所有5个序列来匹配模型的seq_per_img设置
+                                for seq_idx in range(cfg.DATA_LOADER.SEQ_PER_IMG):
+                                    if seq_idx < in_arr.shape[0]:
+                                        input_list.append(in_arr[seq_idx])
+                                        target_list.append(tgt_arr[seq_idx])
+                                    else:
+                                        # 如果序列不足5个，重复最后一个
+                                        input_list.append(in_arr[-1])
+                                        target_list.append(tgt_arr[-1])
                             
-                            # 现在input_seq和target_seq的形状应该是 [batch_size*seq_per_img, seq_len]
-                            # 这与模型期望的维度匹配
-                            
-                            # 构建损失计算所需的kwargs
-                            loss_kwargs = dict(kwargs)
-                            loss_kwargs[cfg.PARAM.INPUT_SENT] = input_seq
-                            loss_kwargs[cfg.PARAM.TARGET_SENT] = target_seq
-                            
-                            # 不需要修改seq_per_img，因为现在序列数量已经匹配了
-                            m = getattr(model, 'module', model)
-                            # 前向得到 log-probs
-                            logit = m(**loss_kwargs)
-                            
-                            # logit形状应该是 [batch_size*seq_per_img, seq_len, vocab_size]
-                            if logit.dim() == 3:  # [batch*seq_per_img, seq_len, vocab_size]
-                                batch_loss, batch_loss_info = xe_criterion(logit, target_seq)
-                            else:
-                                # 如果维度不对，跳过损失计算
-                                batch_loss = None
+                            if len(input_list) > 0:
+                                input_seq = torch.from_numpy(np.stack(input_list, 0)).long().to(device)
+                                target_seq = torch.from_numpy(np.stack(target_list, 0)).long().to(device)
                                 
-                            # accumulate weighted by batch size (number of sequences)
-                            if batch_loss is not None:
-                                try:
-                                    # 注意：现在序列数量是 batch_size * seq_per_img
-                                    bs = int(target_seq.size(0))
-                                    loss_sum += float(batch_loss.item()) * bs
-                                    loss_count += bs
-                                except Exception:
-                                    pass
-                    except Exception as e:
-                        # 仅在第一个批次打印详细错误信息用于调试
-                        if len(results) == 0:  # 第一个批次
-                            print(f"[信息] XE Loss计算已禁用: {type(e).__name__} - {str(e)}")
-                        batch_loss = None
-                m = getattr(model, 'module', model)
-                if kwargs['BEAM_SIZE'] > 1:
-                    seq, _ = m.decode_beam(**kwargs)
-                else:
-                    seq, _ = m.decode(**kwargs)
+                                # 现在input_seq和target_seq的形状应该是 [batch_size*seq_per_img, seq_len]
+                                # 这与模型期望的维度匹配
+                                
+                                # 构建损失计算所需的kwargs
+                                loss_kwargs = dict(kwargs)
+                                loss_kwargs[cfg.PARAM.INPUT_SENT] = input_seq
+                                loss_kwargs[cfg.PARAM.TARGET_SENT] = target_seq
+                                
+                                # 不需要修改seq_per_img，因为现在序列数量已经匹配了
+                                m = getattr(model, 'module', model)
+                                # 前向得到 log-probs
+                                logit = m(**loss_kwargs)
+                                
+                                # logit形状应该是 [batch_size*seq_per_img, seq_len, vocab_size]
+                                if logit.dim() == 3:  # [batch*seq_per_img, seq_len, vocab_size]
+                                    batch_loss, batch_loss_info = xe_criterion(logit, target_seq)
+                                else:
+                                    # 如果维度不对，跳过损失计算
+                                    batch_loss = None
+                                    
+                                # accumulate weighted by batch size (number of sequences)
+                                if batch_loss is not None:
+                                    try:
+                                        # 注意：现在序列数量是 batch_size * seq_per_img
+                                        bs = int(target_seq.size(0))
+                                        loss_sum += float(batch_loss.item()) * bs
+                                        loss_count += bs
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            # 仅在第一个批次打印详细错误信息用于调试
+                            if len(results) == 0:  # 第一个批次
+                                print(f"[信息] XE Loss计算已禁用: {type(e).__name__} - {str(e)}")
+                            batch_loss = None
+                    m = getattr(model, 'module', model)
+                    if kwargs['BEAM_SIZE'] > 1:
+                        seq, _ = m.decode_beam(**kwargs)
+                    else:
+                        seq, _ = m.decode(**kwargs)
 
-                sents = utils.decode_sequence(self.vocab, seq.data)
+                    sents = utils.decode_sequence(self.vocab, seq.data)
 
                 # --- 关键修复：修改 image_id 以区分不同的损坏样本 ---
                 # 1. 获取原始批次大小和增强因子
@@ -234,7 +282,7 @@ class CocoEvaler(object):
                         print(f"[DEBUG ID] sid: {sid}, original_idx: {original_sample_idx}, aug_idx: {augmentation_idx}, original_id: {original_image_id}, unique_id: {unique_image_id}")
                     # ------------------------------------
 
-                    result = {cfg.INFERENCE.ID_KEY: unique_image_id, cfg.INFERENCE.CAP_KEY: sent}
+                    result = {cfg.INFERENCE.ID_KEY: original_image_id, cfg.INFERENCE.CAP_KEY: sent}
                     results.append(result)
 
                     # 后续的打印逻辑也需要使用新的 unique_id 来查找参考标题
@@ -317,6 +365,7 @@ class CocoEvaler(object):
         
         print(f"{'='*80}")
         print(f"Total samples evaluated: {len(results)}")
+        print(f"Undecodable images (skipped): {undecodable_count}")
         print(f"{'='*80}\n")
 
         result_folder = os.path.join(cfg.ROOT_DIR, 'result')
@@ -325,5 +374,6 @@ class CocoEvaler(object):
         
         json.dump(results, open(os.path.join(result_folder, 'result_' + rname + '.json'), 'w'))
 
-        model.train()
+        if self.eval_mode == 'byteformer':
+            model.train() # 恢复模型状态
         return eval_res
